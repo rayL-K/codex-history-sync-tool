@@ -69,6 +69,7 @@ def replace_file_with_retry(source_path: Path, target_path: Path) -> None:
     last_error: OSError | None = None
     for attempt in range(FILE_REPLACE_RETRY_LIMIT):
         try:
+            # 用原子替换避免写到一半被 Codex 读到半成品文件。
             source_path.replace(target_path)
             return
         except PermissionError as exc:
@@ -339,6 +340,7 @@ def restore_metadata(paths: Paths, backup_path: Path) -> dict[str, object]:
             path = raw_path if raw_path.is_absolute() else paths.codex_home / raw_path
             if not path.exists():
                 continue
+            # 只恢复首行 session_meta，后面的对话内容保持原文件不动。
             replace_first_line(path, str(item["first_line"]))
             session_files_restored += 1
 
@@ -434,7 +436,12 @@ def sync_session_records(paths: Paths, current_provider: str) -> dict[str, objec
 
 def is_locked_error(exc: sqlite3.OperationalError) -> bool:
     message = str(exc).lower()
-    return "database is locked" in message or "database table is locked" in message or "database is busy" in message
+    return (
+        "database is locked" in message
+        or "database table is locked" in message
+        or "database is busy" in message
+        or "destination database is in use" in message
+    )
 
 
 def checkpoint(conn: sqlite3.Connection, mode: str = SYNC_CHECKPOINT_MODE) -> tuple[int, int, int]:
@@ -453,6 +460,7 @@ def update_provider_assignments(paths: Paths, current_provider: str) -> dict[str
                 readonly=False,
                 timeout_seconds=WRITE_OPERATION_TIMEOUT_SECONDS,
             ) as conn:
+                # 显式拿写锁，把等待控制在我们自己的重试节奏里。
                 conn.execute("BEGIN IMMEDIATE")
                 before_counts = query_provider_counts(conn)
                 updated_rows = conn.execute(
@@ -490,6 +498,48 @@ def update_provider_assignments(paths: Paths, current_provider: str) -> dict[str
             time.sleep(WRITE_LOCK_RETRY_DELAY_SECONDS)
 
     raise RuntimeError("Database write lock retry loop ended unexpectedly.") from last_error
+
+
+def restore_database_with_retry(paths: Paths, chosen_backup: Path) -> dict[str, object]:
+    started_at = time.monotonic()
+    last_error: sqlite3.OperationalError | None = None
+
+    for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
+        try:
+            with connect_db(chosen_backup, readonly=True) as source, connect_db(
+                paths.db_path,
+                readonly=False,
+                timeout_seconds=WRITE_OPERATION_TIMEOUT_SECONDS,
+            ) as target:
+                # SQLite 在整库 backup 到目标库时会自己申请所需锁；
+                # 这里直接尝试 restore，失败后统一按“数据库正忙”重试即可。
+                source.backup(target)
+                checkpoint_result = checkpoint(target)
+
+            return {
+                "attempts": attempt,
+                "lock_wait_ms": elapsed_ms(started_at),
+                "checkpoint": {
+                    "mode": SYNC_CHECKPOINT_MODE,
+                    "busy": checkpoint_result[0],
+                    "log_frames": checkpoint_result[1],
+                    "checkpointed_frames": checkpoint_result[2],
+                },
+            }
+        except sqlite3.OperationalError as exc:
+            if not is_locked_error(exc):
+                raise
+            last_error = exc
+            if attempt >= WRITE_LOCK_RETRY_LIMIT:
+                waited_seconds = (time.monotonic() - started_at)
+                raise RuntimeError(
+                    "Codex 当前正在写入本地历史数据库，"
+                    f"已等待 {waited_seconds:.1f} 秒仍无法完成还原。"
+                    "请等当前回复、工具调用或自动保存结束后再试一次。"
+                ) from exc
+            time.sleep(WRITE_LOCK_RETRY_DELAY_SECONDS)
+
+    raise RuntimeError("Database restore retry loop ended unexpectedly.") from last_error
 
 
 def get_status(paths: Paths) -> dict[str, object]:
@@ -616,22 +666,13 @@ def restore_backup(paths: Paths, backup_path: str | None) -> dict[str, object]:
     backup_duration_ms = elapsed_ms(backup_started_at)
 
     restore_db_started_at = time.monotonic()
-    with connect_db(chosen_backup, readonly=True) as source, connect_db(paths.db_path, readonly=False) as target:
-        source.backup(target)
-        checkpoint_result = checkpoint(target)
+    restore_db_summary = restore_database_with_retry(paths, chosen_backup)
     restore_db_duration_ms = elapsed_ms(restore_db_started_at)
 
     restore_summary = restore_metadata(paths, chosen_backup)
-    if restore_summary["session_index_restored"]:
-        index_summary = {
-            "rewritten_index_entries": len(read_session_index(paths)),
-            "missing_session_index_entries_before": 0,
-            "preserved_index_only_entries": 0,
-            "duration_ms": 0,
-        }
-    else:
-        with connect_db(paths.db_path, readonly=True) as conn:
-            index_summary = rebuild_session_index(paths, conn)
+    # 恢复后统一重建索引，让数据库与侧边栏索引重新对齐。
+    with connect_db(paths.db_path, readonly=True) as conn:
+        index_summary = rebuild_session_index(paths, conn)
 
     status_after = get_status(paths)
     return {
@@ -639,12 +680,9 @@ def restore_backup(paths: Paths, backup_path: str | None) -> dict[str, object]:
         "restored_from": str(chosen_backup),
         "safety_backup": str(restore_snapshot),
         "metadata_restore": restore_summary,
-        "checkpoint": {
-            "mode": SYNC_CHECKPOINT_MODE,
-            "busy": checkpoint_result[0],
-            "log_frames": checkpoint_result[1],
-            "checkpointed_frames": checkpoint_result[2],
-        },
+        "checkpoint": restore_db_summary["checkpoint"],
+        "lock_wait_ms": restore_db_summary["lock_wait_ms"],
+        "lock_attempts": restore_db_summary["attempts"],
         "rewritten_index_entries": index_summary["rewritten_index_entries"],
         "timing": {
             "backup_ms": backup_duration_ms,
