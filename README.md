@@ -2,7 +2,7 @@
 
 一个用于恢复 Codex Desktop 本地历史对话显示的小工具。
 
-当你切换 API、provider 或登录方式之后，Codex Desktop 有时会出现“本地历史明明还在，但侧边栏看不到”的情况。这个工具会检查本机的本地历史数据库、会话文件和侧边栏索引，并把旧线程重新挂到当前正在使用的 `model_provider` 下面。
+当你切换 API、provider 或登录方式之后，Codex Desktop 有时会出现“本地历史明明还在，但侧边栏看不到”的情况。这个工具会检查本机的本地历史数据库、会话文件和侧边栏索引，并把旧线程重新挂到当前正在使用的 provider 下面。若当前是 ChatGPT 登录而 `config.toml` 里没有 `model_provider`，工具会自动根据 `auth.json` 推断为 `openai`。
 
 ## 这个工具能做什么
 
@@ -18,6 +18,7 @@
 - 你切换了不同 API
 - 你切换了不同 provider
 - 你切换了登录方式
+- 你需要把 API 登录时的本地历史重新挂到 ChatGPT 登录后的当前账号
 - 你确认本地历史文件还在，但 Codex Desktop 左侧历史列表变空了
 
 ## 不适用的场景

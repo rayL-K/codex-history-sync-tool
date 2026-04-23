@@ -31,6 +31,7 @@ def default_codex_home() -> Path:
 class Paths:
     codex_home: Path
     config_path: Path
+    auth_path: Path
     db_path: Path
     backup_dir: Path
     session_index_path: Path
@@ -44,11 +45,19 @@ class SessionRecord:
     model_provider: str
 
 
+@dataclass(frozen=True)
+class CurrentIdentity:
+    provider: str
+    provider_source: str
+    auth_mode: str | None
+
+
 def resolve_paths(codex_home: str | None) -> Paths:
     home = Path(codex_home).expanduser() if codex_home else default_codex_home()
     return Paths(
         codex_home=home,
         config_path=home / "config.toml",
+        auth_path=home / "auth.json",
         db_path=home / "state_5.sqlite",
         backup_dir=home / "history_sync_backups",
         session_index_path=home / "session_index.jsonl",
@@ -96,16 +105,77 @@ def write_text_exact(path: Path, text: str) -> None:
             temp_path.unlink()
 
 
-def parse_current_provider(config_text: str) -> str:
+def parse_config_provider(config_text: str) -> str | None:
     match = re.search(r'(?m)^\s*model_provider\s*=\s*"([^"]+)"', config_text)
-    if not match:
+    return match.group(1) if match else None
+
+
+def parse_current_provider(config_text: str) -> str:
+    provider = parse_config_provider(config_text)
+    if not provider:
         raise RuntimeError("Could not find model_provider in config.toml.")
-    return match.group(1)
+    return provider
 
 
 def parse_current_model(config_text: str) -> str | None:
     match = re.search(r'(?m)^\s*model\s*=\s*"([^"]+)"', config_text)
     return match.group(1) if match else None
+
+
+def read_json_file(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+
+    payload = json.loads(read_text(path))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Expected a JSON object in {path}.")
+    return payload
+
+
+def parse_auth_mode(auth_payload: dict[str, object] | None) -> str | None:
+    if not auth_payload:
+        return None
+
+    auth_mode = str(auth_payload.get("auth_mode") or "").strip()
+    return auth_mode or None
+
+
+def infer_provider_from_auth(auth_payload: dict[str, object] | None) -> str | None:
+    auth_mode = parse_auth_mode(auth_payload)
+    if auth_mode == "chatgpt":
+        # ChatGPT 登录模式通常不会在 config.toml 里写 model_provider，
+        # 但本地线程仍归到 openai provider 下。
+        return "openai"
+
+    if auth_mode == "api_key" and auth_payload and auth_payload.get("OPENAI_API_KEY"):
+        return "openai"
+
+    return None
+
+
+def resolve_current_identity(paths: Paths, config_text: str) -> CurrentIdentity:
+    config_provider = parse_config_provider(config_text)
+    auth_payload = read_json_file(paths.auth_path)
+    auth_mode = parse_auth_mode(auth_payload)
+
+    if config_provider:
+        return CurrentIdentity(
+            provider=config_provider,
+            provider_source="config.toml:model_provider",
+            auth_mode=auth_mode,
+        )
+
+    auth_provider = infer_provider_from_auth(auth_payload)
+    if auth_provider:
+        return CurrentIdentity(
+            provider=auth_provider,
+            provider_source=f"auth.json:auth_mode={auth_mode}",
+            auth_mode=auth_mode,
+        )
+
+    raise RuntimeError(
+        "Could not determine the current provider from config.toml or auth.json."
+    )
 
 
 def connect_db(
@@ -118,7 +188,8 @@ def connect_db(
         busy_timeout_ms = max(1, int(timeout_seconds * 1000))
 
     if readonly:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout_seconds)
+        readonly_uri = f"{path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(readonly_uri, uri=True, timeout=timeout_seconds)
     else:
         conn = sqlite3.connect(str(path), timeout=timeout_seconds)
 
@@ -545,7 +616,8 @@ def restore_database_with_retry(paths: Paths, chosen_backup: Path) -> dict[str, 
 def get_status(paths: Paths) -> dict[str, object]:
     ensure_environment(paths)
     config_text = read_text(paths.config_path)
-    current_provider = parse_current_provider(config_text)
+    current_identity = resolve_current_identity(paths, config_text)
+    current_provider = current_identity.provider
     current_model = parse_current_model(config_text)
     session_records = scan_session_records(paths)
     session_provider_counts = ordered_counts([record.model_provider for record in session_records])
@@ -573,6 +645,8 @@ def get_status(paths: Paths) -> dict[str, object]:
         "sessions_dir": str(paths.sessions_dir),
         "backup_dir": str(paths.backup_dir),
         "current_provider": current_provider,
+        "current_provider_source": current_identity.provider_source,
+        "current_auth_mode": current_identity.auth_mode,
         "current_model": current_model,
         "total_threads": total_threads,
         "movable_threads": len(sync_candidate_ids),
@@ -619,6 +693,8 @@ def sync_to_current_provider(paths: Paths) -> dict[str, object]:
     return {
         "action": "sync",
         "current_provider": current_provider,
+        "current_provider_source": status_before["current_provider_source"],
+        "current_auth_mode": status_before["current_auth_mode"],
         "updated_rows": db_summary["updated_rows"],
         "updated_session_files": session_summary["updated_session_files"],
         "backup_path": str(backup_path),

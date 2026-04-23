@@ -165,7 +165,18 @@ function Apply-State {
 
   $script:LatestState = $Status
 
-  $providerLabel.Text = "当前账号/Provider: $($Status.current_provider)"
+  $providerHints = @()
+  if ($Status.current_auth_mode) {
+    $providerHints += "登录方式: $($Status.current_auth_mode)"
+  }
+  if ($Status.current_provider_source) {
+    $providerHints += "来源: $($Status.current_provider_source)"
+  }
+  $providerText = "当前账号/Provider: $($Status.current_provider)"
+  if ($providerHints.Count -gt 0) {
+    $providerText += "（$($providerHints -join '，')）"
+  }
+  $providerLabel.Text = $providerText
   $modelLabel.Text = if ($Status.current_model) { "当前模型: $($Status.current_model)" } else { '当前模型: 未读取到' }
   $summaryLabel.Text = "历史线程: $($Status.total_threads)    会话文件: $($Status.session_file_count)    侧边栏索引: $($Status.indexed_threads)"
   $repairLabel.Text = "待修复: $($Status.movable_threads)    数据库: $($Status.movable_database_threads)    会话文件: $($Status.movable_session_threads)    索引: $($Status.missing_session_index_entries)"
@@ -256,6 +267,7 @@ $form.Controls.Add($progressBar)
 $providerLabel = New-Object System.Windows.Forms.Label
 $providerLabel.Text = '当前账号/Provider:'
 $providerLabel.AutoSize = $true
+$providerLabel.MaximumSize = New-Object System.Drawing.Size(840, 0)
 $providerLabel.Location = New-Object System.Drawing.Point(28, 150)
 $form.Controls.Add($providerLabel)
 
@@ -386,7 +398,11 @@ $syncButton.Add_Click({
       Append-Log '同步跳过：当前已经没有需要修复的历史。'
       return
     }
-    $message = "将把旧账号/Provider 下的本地历史挂回当前账号：`r`n$($script:LatestState.current_provider)`r`n`r`n本次预计处理：$($script:LatestState.movable_threads) 项`r`n包含数据库记录、会话文件和侧边栏索引。`r`n`r`n工具会先自动备份。Codex 正在运行也可以，但如果它正在写入历史，可能会等待几秒。"
+    $targetText = [string]$script:LatestState.current_provider
+    if ($script:LatestState.current_auth_mode) {
+      $targetText += "（登录方式: $($script:LatestState.current_auth_mode)）"
+    }
+    $message = "将把旧账号/Provider 下的本地历史挂回当前账号：`r`n$targetText`r`n`r`n本次预计处理：$($script:LatestState.movable_threads) 项`r`n包含数据库记录、会话文件和侧边栏索引。`r`n`r`n工具会先自动备份。Codex 正在运行也可以，但如果它正在写入历史，可能会等待几秒。"
     if (-not (Confirm-Action -Message $message -Title '开始找回历史？')) {
       Append-Log '用户取消了同步。'
       return
