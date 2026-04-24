@@ -2,12 +2,13 @@
 
 一个用于恢复 Codex Desktop 本地历史对话显示的小工具。
 
-当你切换 API、provider 或登录方式之后，Codex Desktop 有时会出现“本地历史明明还在，但侧边栏看不到”的情况。这个工具会检查本机的本地历史数据库，并把旧线程重新挂到当前正在使用的 `model_provider` 下面。
+当你切换 API、provider、模型或登录方式之后，Codex Desktop 有时会出现“本地历史明明还在，但侧边栏看不到”的情况。这个工具会检查本机的本地历史数据库，并把旧线程重新挂到当前正在使用的 `model_provider` / `model` 下面。
 
 ## 这个工具能做什么
 
 - 查看当前本机 Codex 历史线程属于哪些 provider
-- 一键把旧 provider 下的线程同步到当前 provider
+- 查看当前本机 Codex 历史线程属于哪些 model
+- 一键把旧 provider / model 下的线程同步到当前设置
 - 在同步前自动备份数据库
 - 从备份恢复数据库
 - 提供一个可直接点击的 Windows 图形界面
@@ -16,6 +17,7 @@
 
 - 你切换了不同 API
 - 你切换了不同 provider
+- 你切换了不同模型
 - 你切换了登录方式
 - 你确认本地历史文件还在，但 Codex Desktop 左侧历史列表变空了
 
@@ -29,7 +31,7 @@
 
 - Windows
 - PowerShell 5.1 或更高版本
-- 已安装 Python，并可通过 `py -3` 调用
+- 已安装 Python 3.10 或更高版本，并可通过 `py -3` 调用
 - 本机存在 Codex Desktop 本地数据目录，通常是 `%USERPROFILE%\\.codex`
 
 ## 快速使用
@@ -70,6 +72,12 @@ py -3 .\sync_backend.py --json backup
 py -3 .\sync_backend.py --json restore
 ```
 
+### 运行测试
+
+```powershell
+py -3 -m unittest discover -s tests -v
+```
+
 ## 备份说明
 
 - 每次同步前都会自动创建一份备份
@@ -78,8 +86,9 @@ py -3 .\sync_backend.py --json restore
 
 ## 使用建议
 
-- 最稳妥的做法是先关闭 Codex Desktop，再执行同步或恢复
+- 执行同步或恢复前请先关闭 Codex Desktop；如果 Codex 同时运行，它可能继续写入数据库，导致同步不完整或恢复结果被覆盖
 - 如果同步完成后历史列表没有立刻刷新，重开一次 Codex Desktop 即可
+- 新版 Codex 可能还会按当前项目目录显示历史。如果同步后仍然看不到旧对话，先确认是否打开了旧对话原来的项目目录；本工具默认不会批量改写线程的 `cwd` 项目归属。
 
 ## 项目文件
 

@@ -93,13 +93,23 @@ function Format-Counts {
   return (($Counts | ForEach-Object { "$($_.provider)=$($_.count)" }) -join ', ')
 }
 
+function Format-ModelCounts {
+  param($Counts)
+
+  if (-not $Counts -or $Counts.Count -eq 0) {
+    return '无'
+  }
+
+  return (($Counts | ForEach-Object { "$($_.model)=$($_.count)" }) -join ', ')
+}
+
 function Refresh-State {
   $status = Invoke-Backend @('--json', 'status')
   $script:LatestState = $status
 
-  $providerLabel.Text = "当前 provider: $($status.current_provider)"
-  $modelLabel.Text = if ($status.current_model) { "当前模型: $($status.current_model)" } else { '当前模型: 未读取到' }
-  $summaryLabel.Text = "线程总数: $($status.total_threads)    可同步到当前 provider 的线程: $($status.movable_threads)"
+  $providerLabel.Text = "当前 provider: $($status.current_provider)    需同步 provider 线程: $($status.provider_movable_threads)"
+  $modelLabel.Text = if ($status.current_model) { "当前模型: $($status.current_model)    需同步模型线程: $($status.model_movable_threads)" } else { '当前模型: 未读取到' }
+  $summaryLabel.Text = "线程总数: $($status.total_threads)    可同步到当前 provider/model 的线程: $($status.movable_threads)"
   $pathLabel.Text = "数据库: $($status.db_path)"
 
   $providersView.Items.Clear()
@@ -119,7 +129,7 @@ function Refresh-State {
     [void]$backupList.Items.Add($label)
   }
 
-  Append-Log "状态已刷新。当前 provider=$($status.current_provider)，可同步线程=$($status.movable_threads)。"
+  Append-Log "状态已刷新。当前 provider=$($status.current_provider)，当前模型=$($status.current_model)，可同步线程=$($status.movable_threads)。"
 }
 
 function Confirm-Action {
@@ -154,7 +164,7 @@ $headerLabel.Location = New-Object System.Drawing.Point(20, 18)
 $form.Controls.Add($headerLabel)
 
 $warningLabel = New-Object System.Windows.Forms.Label
-$warningLabel.Text = '建议先关闭 Codex Desktop 再做同步或恢复，这样最稳。'
+$warningLabel.Text = '请先关闭 Codex Desktop 再做同步或恢复；否则 Codex 可能同时写库，导致同步不完整或被覆盖。'
 $warningLabel.ForeColor = [System.Drawing.Color]::FromArgb(163, 64, 31)
 $warningLabel.AutoSize = $true
 $warningLabel.Location = New-Object System.Drawing.Point(22, 52)
@@ -282,11 +292,11 @@ $syncButton.Add_Click({
       Refresh-State
     }
     if ([int]$script:LatestState.movable_threads -le 0) {
-      [System.Windows.Forms.MessageBox]::Show('当前已经全部归到正在使用的 provider 下面了。', '无需同步', 'OK', 'Information') | Out-Null
+      [System.Windows.Forms.MessageBox]::Show('当前已经全部归到正在使用的 provider/model 下面了。', '无需同步', 'OK', 'Information') | Out-Null
       Append-Log '同步跳过：没有需要迁移的线程。'
       return
     }
-    $message = "将会把其他 provider 的线程统一归到当前 provider:`r`n$($script:LatestState.current_provider)`r`n`r`n本次预计移动线程数: $($script:LatestState.movable_threads)`r`n每次都会先自动备份数据库。"
+    $message = "请先关闭 Codex Desktop，再继续同步。`r`n`r`n将会把其他 provider/model 的线程统一归到当前设置:`r`nprovider: $($script:LatestState.current_provider)`r`nmodel: $($script:LatestState.current_model)`r`n`r`n本次预计移动线程数: $($script:LatestState.movable_threads)`r`n每次都会先自动备份数据库。"
     if (-not (Confirm-Action -Message $message -Title '确认同步')) {
       Append-Log '用户取消了同步。'
       return
@@ -294,8 +304,10 @@ $syncButton.Add_Click({
 
     $result = Invoke-Backend @('--json', 'sync')
     Append-Log "同步完成。已移动 $($result.updated_rows) 条线程。"
-    Append-Log "同步前: $(Format-Counts $result.before_counts)"
-    Append-Log "同步后: $(Format-Counts $result.after_counts)"
+    Append-Log "Provider 同步前: $(Format-Counts $result.before_counts)"
+    Append-Log "Provider 同步后: $(Format-Counts $result.after_counts)"
+    Append-Log "模型同步前: $(Format-ModelCounts $result.before_model_counts)"
+    Append-Log "模型同步后: $(Format-ModelCounts $result.after_model_counts)"
     Append-Log "备份文件: $($result.backup_path)"
     Refresh-State
     [System.Windows.Forms.MessageBox]::Show('同步完成。若左侧历史列表没有立刻刷新，重开一次 Codex 即可。', '同步完成', 'OK', 'Information') | Out-Null
@@ -356,7 +368,7 @@ $restoreButton.Add_Click({
       throw '无法解析选中的备份路径。'
     }
 
-    $message = "将会恢复这个备份：`r`n$backupPath`r`n`r`n恢复前会再自动生成一份安全备份。"
+    $message = "请先关闭 Codex Desktop，再继续恢复。`r`n`r`n将会恢复这个备份：`r`n$backupPath`r`n`r`n恢复前会再自动生成一份安全备份。"
     if (-not (Confirm-Action -Message $message -Title '确认恢复')) {
       Append-Log '用户取消了恢复。'
       return
@@ -375,7 +387,7 @@ $restoreButton.Add_Click({
 
 $restoreLatestButton.Add_Click({
   try {
-    if (-not (Confirm-Action -Message '将会恢复最新备份，并在恢复前再做一次安全备份。' -Title '确认恢复最新备份')) {
+    if (-not (Confirm-Action -Message '请先关闭 Codex Desktop，再继续恢复。将会恢复最新备份，并在恢复前再做一次安全备份。' -Title '确认恢复最新备份')) {
       Append-Log '用户取消了恢复最新备份。'
       return
     }

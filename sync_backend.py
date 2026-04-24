@@ -5,6 +5,8 @@ import json
 import re
 import sqlite3
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -48,12 +50,21 @@ def parse_current_model(config_text: str) -> str | None:
     return match.group(1) if match else None
 
 
-def connect_db(path: Path, readonly: bool = False) -> sqlite3.Connection:
+@contextmanager
+def connect_db(path: Path, readonly: bool = False) -> Iterator[sqlite3.Connection]:
     if readonly:
-        return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
-    conn = sqlite3.connect(str(path), timeout=30)
-    conn.execute("PRAGMA busy_timeout = 30000")
-    return conn
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    else:
+        conn = sqlite3.connect(str(path), timeout=30)
+        conn.execute("PRAGMA busy_timeout = 30000")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def get_thread_columns(conn: sqlite3.Connection) -> set[str]:
+    return {str(row[1]) for row in conn.execute("PRAGMA table_info(threads)")}
 
 
 def ensure_environment(paths: Paths) -> None:
@@ -75,6 +86,77 @@ def query_provider_counts(conn: sqlite3.Connection) -> OrderedDict[str, int]:
     ):
         counts[provider or "(empty)"] = count
     return counts
+
+
+def query_model_counts(conn: sqlite3.Connection) -> OrderedDict[str, int]:
+    counts = OrderedDict()
+    for model, count in conn.execute(
+        """
+        SELECT model, COUNT(*)
+        FROM threads
+        GROUP BY model
+        ORDER BY COUNT(*) DESC, model ASC
+        """
+    ):
+        counts[model or "(empty)"] = count
+    return counts
+
+
+def query_provider_model_counts(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    rows = []
+    for provider, model, count in conn.execute(
+        """
+        SELECT model_provider, model, COUNT(*)
+        FROM threads
+        GROUP BY model_provider, model
+        ORDER BY COUNT(*) DESC, model_provider ASC, model ASC
+        """
+    ):
+        rows.append({"provider": provider or "(empty)", "model": model or "(empty)", "count": count})
+    return rows
+
+
+def query_cwd_counts(conn: sqlite3.Connection, limit: int = 20) -> list[dict[str, object]]:
+    rows = []
+    for cwd, count in conn.execute(
+        """
+        SELECT cwd, COUNT(*)
+        FROM threads
+        GROUP BY cwd
+        ORDER BY COUNT(*) DESC, cwd ASC
+        LIMIT ?
+        """,
+        (limit,),
+    ):
+        rows.append({"cwd": cwd or "(empty)", "count": count})
+    return rows
+
+
+def count_mismatched(conn: sqlite3.Connection, column: str, expected: str | None) -> int:
+    if not expected:
+        return 0
+    return int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM threads WHERE {column} IS NULL OR {column} <> ?",
+            (expected,),
+        ).fetchone()[0]
+    )
+
+
+def count_sync_candidates(
+    conn: sqlite3.Connection,
+    *,
+    current_provider: str,
+    current_model: str | None,
+    columns: set[str],
+) -> int:
+    where_parts = ["model_provider IS NULL OR model_provider <> ?"]
+    params: list[str] = [current_provider]
+    if "model" in columns and current_model:
+        where_parts.append("model IS NULL OR model <> ?")
+        params.append(current_model)
+    where_sql = " OR ".join(f"({part})" for part in where_parts)
+    return int(conn.execute(f"SELECT COUNT(*) FROM threads WHERE {where_sql}", params).fetchone()[0])
 
 
 def list_backups(paths: Paths, limit: int = 20) -> list[dict[str, str]]:
@@ -104,12 +186,20 @@ def get_status(paths: Paths) -> dict[str, object]:
     current_model = parse_current_model(config_text)
 
     with connect_db(paths.db_path, readonly=True) as conn:
+        columns = get_thread_columns(conn)
         counts = query_provider_counts(conn)
+        model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
+        provider_model_counts = query_provider_model_counts(conn) if "model" in columns else []
+        cwd_counts = query_cwd_counts(conn) if "cwd" in columns else []
         total_threads = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
-        moved_if_sync = conn.execute(
-            "SELECT COUNT(*) FROM threads WHERE model_provider <> ?",
-            (current_provider,),
-        ).fetchone()[0]
+        provider_movable = count_mismatched(conn, "model_provider", current_provider)
+        model_movable = count_mismatched(conn, "model", current_model) if "model" in columns else None
+        moved_if_sync = count_sync_candidates(
+            conn,
+            current_provider=current_provider,
+            current_model=current_model,
+            columns=columns,
+        )
 
     return {
         "codex_home": str(paths.codex_home),
@@ -120,7 +210,12 @@ def get_status(paths: Paths) -> dict[str, object]:
         "current_model": current_model,
         "total_threads": total_threads,
         "movable_threads": moved_if_sync,
+        "provider_movable_threads": provider_movable,
+        "model_movable_threads": model_movable,
         "provider_counts": [{"provider": key, "count": value} for key, value in counts.items()],
+        "model_counts": [{"model": key, "count": value} for key, value in model_counts.items()],
+        "provider_model_counts": provider_model_counts,
+        "cwd_counts": cwd_counts,
         "backups": list_backups(paths),
     }
 
@@ -141,26 +236,53 @@ def checkpoint(conn: sqlite3.Connection) -> tuple[int, int, int]:
 
 def sync_to_current_provider(paths: Paths) -> dict[str, object]:
     status_before = get_status(paths)
-    current_provider = status_before["current_provider"]
+    current_provider = str(status_before["current_provider"])
+    current_model = status_before.get("current_model")
+    current_model = str(current_model) if current_model else None
     backup_path = make_backup(paths, "pre-sync")
 
     with connect_db(paths.db_path, readonly=False) as conn:
+        columns = get_thread_columns(conn)
         before_counts = query_provider_counts(conn)
+        before_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
+
+        set_parts = ["model_provider = ?"]
+        set_params = [current_provider]
+        where_parts = ["model_provider IS NULL OR model_provider <> ?"]
+        where_params = [current_provider]
+        synced_fields = ["model_provider"]
+
+        if "model" in columns and current_model:
+            set_parts.append("model = ?")
+            set_params.append(current_model)
+            where_parts.append("model IS NULL OR model <> ?")
+            where_params.append(current_model)
+            synced_fields.append("model")
+
+        set_sql = ", ".join(set_parts)
+        where_sql = " OR ".join(f"({part})" for part in where_parts)
         updated_rows = conn.execute(
-            "UPDATE threads SET model_provider = ? WHERE model_provider <> ?",
-            (current_provider, current_provider),
+            f"UPDATE threads SET {set_sql} WHERE {where_sql}",
+            (*set_params, *where_params),
         ).rowcount
         conn.commit()
         checkpoint_result = checkpoint(conn)
         after_counts = query_provider_counts(conn)
+        after_model_counts = query_model_counts(conn) if "model" in columns else OrderedDict()
 
     return {
         "action": "sync",
         "current_provider": current_provider,
+        "current_model": current_model,
+        "synced_fields": synced_fields,
         "updated_rows": updated_rows,
+        "provider_movable_threads": status_before["provider_movable_threads"],
+        "model_movable_threads": status_before["model_movable_threads"],
         "backup_path": str(backup_path),
         "before_counts": [{"provider": key, "count": value} for key, value in before_counts.items()],
         "after_counts": [{"provider": key, "count": value} for key, value in after_counts.items()],
+        "before_model_counts": [{"model": key, "count": value} for key, value in before_model_counts.items()],
+        "after_model_counts": [{"model": key, "count": value} for key, value in after_model_counts.items()],
         "checkpoint": {
             "busy": checkpoint_result[0],
             "log_frames": checkpoint_result[1],
